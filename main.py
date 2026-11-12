@@ -10,20 +10,27 @@ Model (stdlib only, deterministic, no network, no wall-clock):
     over its marks, shrunk hard toward a negative target (top coins decay;
     a spike fitted on two points must not be extrapolated);
   * project each coin to every answer read with drift that decays over a
-    2.5 h time constant and a sigma that widens like a random walk
-    (calibrated on the practice history: top-20 coins move ~0.28 log10
-    per 10 min, mean about -0.08);
+    2.5 h time constant and a sigma that widens like a random walk;
   * seeded Monte Carlo (fixed seed) over the top candidates ranks the
     coins at each read, giving place probabilities and the distribution
-    of each place's log-cap (sizes);
+    of each place's log-cap (sizes). Each draw first asks whether the
+    coin has rugged by that read (a steep, saturating hazard: in the
+    practice ~2 of the top 11 had rugged within 10 min and ~8 of 11
+    within the hour); a rugged coin falls to the post-rug floor near
+    log 1.3 (~19 SOL). Survivors move with a modest Gaussian sigma --
+    the big moves ARE the rugs, so the Gaussian must not also be huge;
   * newcomers (coins born after the history ends, which no forecast can
-    name) are modelled explicitly: a per-read newcomer share grows with
-    the horizon, the history coins' place mass is shifted down by a
+    name) are modelled explicitly, per place: place 1 is usually the
+    freshest viral launch, places 2-3 usually survivors, places 4-5
+    fresh risers, so the newcomer share is top-heavy and grows with the
+    horizon; the history coins' place mass is shifted down by a
     binomial count of newcomers in the top 5, and the leftover mass is
     left unnamed so the scorer shares it over the answer chart's
     un-named coins (newcomers included);
-  * sizes mix the Monte Carlo history distribution with a wider,
-    higher newcomer component;
+  * sizes mix the Monte Carlo history distribution with a wide, higher
+    newcomer component (a viral newcomer routinely exceeds the fading
+    history #1, as MAX did in the practice); the winner's-curse cap
+    applies to the history component only;
   * a coin is named at a place only when its probability beats the
     per-coin share the place would otherwise leave unnamed.
 """
@@ -37,13 +44,29 @@ SEED = 20261112
 NSAMPLES = 4000
 MAX_CANDIDATES = 150
 TAU_H = 2.5            # drift decay time, hours
-VOL_RATE = 0.60        # log10 sd per sqrt(hour)
-SIG0 = 0.12            # base log10 sd
-SIG_CAP = 1.1          # max projected log10 sd
+VOL_RATE = 0.35        # log10 sd per sqrt(hour) for a SURVIVING coin (the
+                     # big moves are rugs, modelled separately below, so the
+                     # Gaussian part is the modest drift of survivors)
+SIG0 = 0.10            # base log10 sd
+SIG_CAP = 0.65         # max projected log10 sd for a survivor
 COMMON_SD = 0.12       # shared shock per Monte Carlo sample (sizes only)
-NEW_SD = 0.5           # newcomer size distribution sd
+RUG_LEVEL = 1.3        # log10 cap a rugged coin falls to (~19 SOL: in the
+                     # practice every top coin that rugged landed near here)
+RUG_SD = 0.15          # spread of the post-rug level
+NEW_SD = 0.8           # newcomer size distribution sd (wide: a viral newcomer
+                     # can land anywhere from a dud to far above the history's #1)
 CURVE_CAP = 2.55       # log10 cap of a coin still on its bonding curve
 MICRO = 1_000_000
+# Place weights for the newcomer share: the largest coin at a read is
+# usually the freshest viral launch, so place 1 is newcomer-dominated
+# while places 2-3 are usually survivors (weights average 1.0).
+NEW_W = [1.7, 0.65, 0.65, 1.0, 1.0]
+# Extra size premium of a newcomer taking place k, over the last mark's
+# k-th cap (place 1's premium is the largest: a viral newcomer routinely
+# exceeds the fading history #1, as MAX did in the practice).
+NEW_PREM = [0.6, 0.3, 0.25, 0.25, 0.25]
+# Winner's-curse cap slack over the last mark's k-th cap, per place.
+WCAP = [1.0, 0.6, 0.5, 0.5, 0.5]
 
 
 def parse_time(s):
@@ -98,13 +121,36 @@ def binom5(r):
 
 
 def newcomer_share(t_hours):
-    """Share of top-5 slots taken by coins born after the history ends.
+    """Mean share of top-5 slots taken by coins born after the history ends.
 
     Top-5 coins are typically under an hour old, so the share grows with
     the horizon: at the practice's ~1 h it is ~0.3, at the final's
     7-13 h the history's coins are long past their prime and it is ~0.7.
     """
     return min(0.72, max(0.15, 0.20 + 0.14 * math.sqrt(max(t_hours, 0.0))))
+
+
+def rug_prob(t_hours):
+    """Probability a history coin has rugged by a read t_hours after the
+    last mark. In the practice ~2 of the top 11 had rugged within 10 min
+    and ~8 of 11 within the hour, so the hazard is steep and saturating;
+    by the final's 7-13 h horizon essentially every history coin is dead
+    or faded, which is why the newcomer reserve is so large there.
+    """
+    return min(0.90, 0.15 + 0.45 * max(t_hours, 0.0))
+
+
+def newcomer_shares(t_hours, places):
+    """Per-place newcomer shares.
+
+    The mean is newcomer_share(); the split is top-heavy: place 1 is
+    usually the freshest viral launch (in the practice it was a newcomer
+    in 6 of 7 reads), places 2-3 usually survivors, places 4-5 fresh
+    risers. Each share is capped at 0.9: even at the final's horizon a
+    history coin can still, rarely, hold a place.
+    """
+    base = newcomer_share(t_hours)
+    return [min(0.9, base * NEW_W[k - 1]) for k in range(1, places + 1)]
 
 
 def main():
@@ -251,6 +297,7 @@ def main():
 
     for ri, h in enumerate(horizons):
         r_share = newcomer_share(h)
+        r_k = newcomer_shares(h, places)
         b5 = binom5(r_share)
         mus = []
         sigs = []
@@ -262,11 +309,18 @@ def main():
         q = [[0.0] * (places + 1) for _ in range(n_c)]  # q[i][k]
         size_hist = [[0.0] * nbins for _ in range(places + 1)]
         kth_mean = [0.0] * (places + 1)
+        qr = rug_prob(h)
         for _s in range(NSAMPLES):
             common = rng.gauss(0.0, COMMON_SD)
             top = []  # list of (y, idx), descending, at most `places`
             for i in range(n_c):
-                y = rng.gauss(mus[i], sigs[i]) + common
+                # A coin either survives (Gaussian drift around its
+                # projection) or has rugged by this read (it falls to the
+                # post-rug floor, ~19 SOL, and is out of the top 5).
+                if rng.random() < qr:
+                    y = rng.gauss(RUG_LEVEL, RUG_SD)
+                else:
+                    y = rng.gauss(mus[i], sigs[i]) + common
                 if len(top) < places or y > top[-1][0]:
                     j = 0
                     while j < len(top) and top[j][0] > y:
@@ -289,13 +343,14 @@ def main():
             kth_mean[k] /= NSAMPLES
 
         # Tame the winner's curse: the max of many independent noisy draws
-        # overstates the realised top caps (in the practice the #1 cap only
-        # reached log 3.56 and fresh spikes top out near there). Keep each
-        # place's size mean within a band around the last mark's k-th cap,
-        # and re-centre that place's size histogram by the same shift.
+        # overstates the realised top caps of HISTORY coins. Keep each
+        # place's history size mean within a band around the last mark's
+        # k-th cap, and re-centre that place's size histogram by the same
+        # shift. (The newcomer component below is NOT capped this way: a
+        # fresh viral coin routinely exceeds the fading history #1.)
         for k in range(1, places + 1):
             if k <= len(last_sorted):
-                cap = last_sorted[k - 1] + 0.5 + 0.1 * min(1.0, h / 6.0)
+                cap = last_sorted[k - 1] + WCAP[k - 1] + 0.1 * min(1.0, h / 6.0)
                 floor = last_sorted[k - 1] - 0.8
                 capped = min(max(kth_mean[k], floor), cap)
                 delta = capped - kth_mean[k]
@@ -304,9 +359,12 @@ def main():
                     kth_mean[k] = capped
 
         # newcomer shift: history coin at place k was (k-j)-th among history
-        # coins when j newcomers sit above it
-        shift = min(0.25, 0.10 + 0.10 * min(1.0, h / 10.0))
+        # coins when j newcomers sit above it. The history mass at place k
+        # is scaled to (1 - r_k): the rest is left unnamed, so the scorer
+        # shares it over the answer chart's un-named coins (newcomers
+        # included) -- which is where a newcomer taking place k is scored.
         for k in range(1, places + 1):
+            rk = r_k[k - 1]
             tot = 0.0
             svals = [0.0] * n_c
             for i in range(n_c):
@@ -317,16 +375,22 @@ def main():
                         s += b5[j] * q[i][m]
                 svals[i] = s
                 tot += s
-            scale = (1.0 - r_share) / tot if tot > 0 else 0.0
+            scale = (1.0 - rk) / tot if tot > 0 else 0.0
             for i in range(n_c):
                 p_sum[cand[i]][k] += svals[i] * scale
-            # sizes: mix history distribution with a wider, higher newcomer one
-            mu_k = kth_mean[k]
+            # sizes: mix the history distribution with a wider, higher
+            # newcomer one. A newcomer taking place k is typically a fresh
+            # viral launch, so its cap sits above the fading history k-th
+            # cap (by NEW_PREM) with a wide spread -- not bounded by it.
+            if k <= len(last_sorted):
+                mu_new = last_sorted[k - 1] + NEW_PREM[k - 1]
+            else:
+                mu_new = kth_mean[k] + 0.3
             for b in range(nbins):
                 lo = -1e9 if b == 0 else edges[b - 1]
                 hi = 1e9 if b == nbins - 1 else edges[b]
-                pn = norm_cdf(hi, mu_k + shift, NEW_SD) - norm_cdf(lo, mu_k + shift, NEW_SD)
-                size_sum[k][b] += (1.0 - r_share) * size_hist[k][b] + r_share * pn
+                pn = norm_cdf(hi, mu_new, NEW_SD) - norm_cdf(lo, mu_new, NEW_SD)
+                size_sum[k][b] += (1.0 - rk) * size_hist[k][b] + rk * pn
 
     n_reads = float(len(reads))
     for mint in cand:
