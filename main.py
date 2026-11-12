@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""pumpfun-top5-forecast-01 entry: trajectory + Monte Carlo forecast.
+
+Reads $MAKEFUN_INPUT_DIR (history.ndjson, task.json) and writes
+$MAKEFUN_OUTPUT_DIR/forecast.json with exactly the keys
+probabilities / top5 / sizes.
+
+Model (stdlib only, deterministic, no network, no wall-clock):
+  * per coin, fit a weighted-least-squares slope of log10(market cap in SOL)
+    over its marks, shrunk hard toward a negative target (top coins decay;
+    a spike fitted on two points must not be extrapolated);
+  * project each coin to every answer read with drift that decays over a
+    2.5 h time constant and a sigma that widens like a random walk
+    (calibrated on the practice history: top-20 coins move ~0.28 log10
+    per 10 min, mean about -0.08);
+  * seeded Monte Carlo (fixed seed) over the top candidates ranks the
+    coins at each read, giving place probabilities and the distribution
+    of each place's log-cap (sizes);
+  * newcomers (coins born after the history ends, which no forecast can
+    name) are modelled explicitly: a per-read newcomer share grows with
+    the horizon, the history coins' place mass is shifted down by a
+    binomial count of newcomers in the top 5, and the leftover mass is
+    left unnamed so the scorer shares it over the answer chart's
+    un-named coins (newcomers included);
+  * sizes mix the Monte Carlo history distribution with a wider,
+    higher newcomer component;
+  * a coin is named at a place only when its probability beats the
+    per-coin share the place would otherwise leave unnamed.
+"""
+import json
+import math
+import os
+import random
+from datetime import datetime
+
+SEED = 20261112
+NSAMPLES = 4000
+MAX_CANDIDATES = 150
+TAU_H = 2.5            # drift decay time, hours
+VOL_RATE = 0.60        # log10 sd per sqrt(hour)
+SIG0 = 0.12            # base log10 sd
+SIG_CAP = 1.1          # max projected log10 sd
+COMMON_SD = 0.12       # shared shock per Monte Carlo sample (sizes only)
+NEW_SD = 0.5           # newcomer size distribution sd
+CURVE_CAP = 2.55       # log10 cap of a coin still on its bonding curve
+MICRO = 1_000_000
+
+
+def parse_time(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def logcap(row):
+    return math.log10(int(row["market_cap_lamports"]) / 1e9)
+
+
+def norm_cdf(x, mu, sd):
+    return 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
+
+
+def shift_hist(hist, db):
+    """Shift a bin histogram by db bins (fractional), linear interpolation."""
+    n = len(hist)
+    out = [0.0] * n
+    for b, v in enumerate(hist):
+        if v == 0.0:
+            continue
+        x = b + db
+        lo = math.floor(x)
+        frac = x - lo
+        if 0 <= lo < n:
+            out[lo] += v * (1.0 - frac)
+        if 0 <= lo + 1 < n:
+            out[lo + 1] += v * frac
+    return out
+
+
+def bin_of(x, edges):
+    if x < edges[0]:
+        return 0
+    if x >= edges[-1]:
+        return len(edges)
+    return int((x - edges[0]) / 0.05) + 1
+
+
+def floor6(p):
+    v = math.floor(p * MICRO) / MICRO
+    return v if v > 0 else 0.0
+
+
+def binom5(r):
+    """P(N = j) for N ~ Binomial(5, r), j = 0..5."""
+    out = []
+    for j in range(6):
+        c = math.comb(5, j)
+        out.append(c * (r ** j) * ((1.0 - r) ** (5 - j)))
+    return out
+
+
+def newcomer_share(t_hours):
+    """Share of top-5 slots taken by coins born after the history ends.
+
+    Top-5 coins are typically under an hour old, so the share grows with
+    the horizon: at the practice's ~1 h it is ~0.3, at the final's
+    7-13 h the history's coins are long past their prime and it is ~0.7.
+    """
+    return min(0.72, max(0.15, 0.20 + 0.14 * math.sqrt(max(t_hours, 0.0))))
+
+
+def main():
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    with open(os.path.join(in_dir, "task.json"), "r", encoding="utf-8") as f:
+        task = json.load(f)
+    places = int(task["places"])
+    edges = [float(e) for e in task["size"]["edges"]]
+    nbins = len(edges) + 1
+    reads = [parse_time(r) for r in task["reads"]]
+    t0 = parse_time(task["t0"])
+
+    marks = []
+    with open(os.path.join(in_dir, "history.ndjson"), "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = json.loads(line)
+            if m.get("ok") and isinstance(m.get("rows"), list) and m["rows"]:
+                marks.append(m)
+    if not marks:
+        raise SystemExit("no ok marks in history")
+    n_marks = len(marks)
+    t_last = (parse_time(marks[-1]["at"]) - t0).total_seconds() / 60.0
+
+    # ---- per-coin observations: mint -> list of (t_min, logcap, venue, complete, created_min, mark_idx)
+    obs = {}
+    for mi, m in enumerate(marks):
+        t = (parse_time(m["at"]) - t0).total_seconds() / 60.0
+        for r in m["rows"]:
+            try:
+                created = (parse_time(r["created_at"]) - t0).total_seconds() / 60.0
+            except Exception:
+                created = t
+            obs.setdefault(r["mint"], []).append(
+                (t, logcap(r), r.get("venue", "curve"),
+                 bool(r.get("complete")), created, mi)
+            )
+    if len(obs) < places:
+        raise SystemExit("history holds fewer coins than places")
+
+    # ---- global median slope (per hour) from coins with >= 2 observations
+    def wls_slope(o):
+        # weights decay with age from the coin's last observation (45 min scale)
+        t_last_o = o[-1][0]
+        sw = st = sy = stt = sty = 0.0
+        for (t, y, _v, _c, _cr, _mi) in o:
+            w = math.exp(-(t_last_o - t) / 45.0)
+            sw += w
+            st += w * t
+            sy += w * y
+            stt += w * t * t
+            sty += w * t * y
+        den = sw * stt - st * st
+        if den <= 1e-12:
+            return None
+        # slope per minute -> per hour
+        return ((sw * sty - st * sy) / den) * 60.0
+
+    all_slopes = []
+    slopes = {}
+    for mint in sorted(obs):
+        s = wls_slope(obs[mint]) if len(obs[mint]) >= 2 else None
+        slopes[mint] = s
+        if s is not None:
+            all_slopes.append(s)
+    all_slopes.sort()
+    if all_slopes:
+        med = all_slopes[len(all_slopes) // 2]
+    else:
+        med = 0.0
+    # Shrinkage target: top coins decay (their mean 10-min change is about
+    # -0.08 log10, the median about 0), so a slope fitted on few points --
+    # a coin that just spiked -- must not be extrapolated. -0.2/h sits
+    # between the median (~0) and the top coins' mean (~-0.5/h).
+    global_slope = min(0.1, max(-0.3, 0.5 * med - 0.1))
+
+    # ---- per-coin fitted state
+    coins = {}
+    for mint in sorted(obs):
+        o = obs[mint]
+        y_last = o[-1][1]
+        venue = o[-1][2]
+        complete = o[-1][3]
+        age_min = t_last - o[-1][4]
+        last_idx = o[-1][5]
+        s = slopes[mint]
+        n = len(o)
+        if s is None:
+            s_shrunk = global_slope
+        else:
+            s_shrunk = (n / (n + 4.0)) * s + (4.0 / (n + 4.0)) * global_slope
+        s_shrunk = min(0.8, max(-0.8, s_shrunk))
+        stale = n_marks - 1 - last_idx
+        coins[mint] = {
+            "y_last": y_last,
+            "slope": s_shrunk,
+            "venue": venue,
+            "complete": complete,
+            "age_min": age_min,
+            "stale": stale,
+        }
+
+    def project(c, t_hours):
+        mu = c["y_last"] + c["slope"] * TAU_H * (1.0 - math.exp(-t_hours / TAU_H))
+        if not c["complete"] and c["venue"] == "curve":
+            mu = min(mu, CURVE_CAP)
+        mu -= 0.2 * c["stale"]
+        sig = math.sqrt(SIG0 * SIG0 + (VOL_RATE * math.sqrt(t_hours)) ** 2)
+        sig = min(SIG_CAP, sig)
+        if not c["complete"] and c["venue"] == "curve":
+            sig *= 1.2
+        if c["age_min"] < 30.0:
+            sig *= 1.15
+        if c["stale"] > 0:
+            sig *= 1.15
+        return mu, sig
+
+    # ---- candidate set: top by max projected mean over the reads
+    horizons = [(r - parse_time(marks[-1]["at"])).total_seconds() / 3600.0
+                for r in reads]
+    scored = []
+    for mint in sorted(coins):
+        c = coins[mint]
+        best = None
+        for h in horizons:
+            mu, _sig = project(c, h)
+            if best is None or mu > best:
+                best = mu
+        scored.append((best, mint))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    cand = [mint for _best, mint in scored[:MAX_CANDIDATES]]
+    cand_set = set(cand)
+
+    # ---- Monte Carlo per read
+    rng = random.Random(SEED)
+    # p_sum[mint][place] and size_sum[place][bin], averaged over reads
+    p_sum = {mint: [0.0] * (places + 1) for mint in cand}
+    size_sum = [[0.0] * nbins for _ in range(places + 1)]
+    mean_h = sum(horizons) / len(horizons) if horizons else 0.0
+    last_sorted = sorted((c["y_last"] for c in coins.values()), reverse=True)
+
+    for ri, h in enumerate(horizons):
+        r_share = newcomer_share(h)
+        b5 = binom5(r_share)
+        mus = []
+        sigs = []
+        for mint in cand:
+            mu, sig = project(coins[mint], h)
+            mus.append(mu)
+            sigs.append(sig)
+        n_c = len(cand)
+        q = [[0.0] * (places + 1) for _ in range(n_c)]  # q[i][k]
+        size_hist = [[0.0] * nbins for _ in range(places + 1)]
+        kth_mean = [0.0] * (places + 1)
+        for _s in range(NSAMPLES):
+            common = rng.gauss(0.0, COMMON_SD)
+            top = []  # list of (y, idx), descending, at most `places`
+            for i in range(n_c):
+                y = rng.gauss(mus[i], sigs[i]) + common
+                if len(top) < places or y > top[-1][0]:
+                    j = 0
+                    while j < len(top) and top[j][0] > y:
+                        j += 1
+                    top.insert(j, (y, i))
+                    if len(top) > places:
+                        top.pop()
+            for k in range(places):
+                yk, ik = top[k]
+                q[ik][k + 1] += 1.0
+                size_hist[k + 1][bin_of(yk, edges)] += 1.0
+                kth_mean[k + 1] += yk
+        inv = 1.0 / NSAMPLES
+        for i in range(n_c):
+            for k in range(1, places + 1):
+                q[i][k] *= inv
+        for k in range(1, places + 1):
+            for b in range(nbins):
+                size_hist[k][b] *= inv
+            kth_mean[k] /= NSAMPLES
+
+        # Tame the winner's curse: the max of many independent noisy draws
+        # overstates the realised top caps (in the practice the #1 cap only
+        # reached log 3.56 and fresh spikes top out near there). Keep each
+        # place's size mean within a band around the last mark's k-th cap,
+        # and re-centre that place's size histogram by the same shift.
+        for k in range(1, places + 1):
+            if k <= len(last_sorted):
+                cap = last_sorted[k - 1] + 0.5 + 0.1 * min(1.0, h / 6.0)
+                floor = last_sorted[k - 1] - 0.8
+                capped = min(max(kth_mean[k], floor), cap)
+                delta = capped - kth_mean[k]
+                if delta != 0.0:
+                    size_hist[k] = shift_hist(size_hist[k], delta / 0.05)
+                    kth_mean[k] = capped
+
+        # newcomer shift: history coin at place k was (k-j)-th among history
+        # coins when j newcomers sit above it
+        shift = min(0.25, 0.10 + 0.10 * min(1.0, h / 10.0))
+        for k in range(1, places + 1):
+            tot = 0.0
+            svals = [0.0] * n_c
+            for i in range(n_c):
+                s = 0.0
+                for j in range(0, min(4, k - 1) + 1):
+                    m = k - j
+                    if 1 <= m <= places:
+                        s += b5[j] * q[i][m]
+                svals[i] = s
+                tot += s
+            scale = (1.0 - r_share) / tot if tot > 0 else 0.0
+            for i in range(n_c):
+                p_sum[cand[i]][k] += svals[i] * scale
+            # sizes: mix history distribution with a wider, higher newcomer one
+            mu_k = kth_mean[k]
+            for b in range(nbins):
+                lo = -1e9 if b == 0 else edges[b - 1]
+                hi = 1e9 if b == nbins - 1 else edges[b]
+                pn = norm_cdf(hi, mu_k + shift, NEW_SD) - norm_cdf(lo, mu_k + shift, NEW_SD)
+                size_sum[k][b] += (1.0 - r_share) * size_hist[k][b] + r_share * pn
+
+    n_reads = float(len(reads))
+    for mint in cand:
+        for k in range(1, places + 1):
+            p_sum[mint][k] /= n_reads
+    for k in range(1, places + 1):
+        for b in range(nbins):
+            size_sum[k][b] /= n_reads
+
+    # ---- emit probabilities: name a coin only while its p beats the share
+    # the place would otherwise leave unnamed per un-named chart coin
+    probabilities = []
+    for k in range(1, places + 1):
+        order = sorted(cand, key=lambda m: (-p_sum[m][k], m))
+        named_sum = 0.0
+        named_n = 0
+        for mint in order:
+            if named_n >= 100:
+                break
+            p = p_sum[mint][k]
+            threshold = (1.0 - named_sum) / max(1, 100 - named_n)
+            if p <= threshold:
+                break
+            pv = floor6(p)
+            if pv <= 0:
+                break
+            probabilities.append({"mint": mint, "place": k, "p": pv})
+            named_sum += pv
+            named_n += 1
+
+    # ---- top5: greedy by place probability
+    top5 = []
+    used = set()
+    for k in range(1, places + 1):
+        best_mint = None
+        best_p = -1.0
+        for mint in cand:
+            if mint in used:
+                continue
+            if p_sum[mint][k] > best_p:
+                best_p = p_sum[mint][k]
+                best_mint = mint
+        if best_mint is None:
+            best_mint = cand[k - 1]
+        top5.append(best_mint)
+        used.add(best_mint)
+
+    # ---- emit sizes
+    sizes = []
+    for k in range(1, places + 1):
+        for b in range(nbins):
+            pv = floor6(size_sum[k][b])
+            if pv > 0:
+                sizes.append({"place": k, "bin": b, "p": pv})
+
+    forecast = {"probabilities": probabilities, "top5": top5, "sizes": sizes}
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, task.get("output", "forecast.json"))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(forecast, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+if __name__ == "__main__":
+    main()
