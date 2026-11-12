@@ -20,17 +20,23 @@ Model (stdlib only, deterministic, no network, no wall-clock):
     log 1.3 (~19 SOL). Survivors move with a modest Gaussian sigma --
     the big moves ARE the rugs, so the Gaussian must not also be huge;
   * newcomers (coins born after the history ends, which no forecast can
-    name) are modelled explicitly, per place: place 1 is usually the
-    freshest viral launch, places 2-3 usually survivors, places 4-5
-    fresh risers, so the newcomer share is top-heavy and grows with the
-    horizon; the history coins' place mass is shifted down by a
-    binomial count of newcomers in the top 5, and the leftover mass is
-    left unnamed so the scorer shares it over the answer chart's
-    un-named coins (newcomers included);
+    name) are modelled explicitly, per place: place 1 is strongly
+    newcomer-dominated (in the practice it was a newcomer in 6 of 7
+    reads), places 2-3 usually survivors, places 4-5 fresh risers, so
+    the newcomer share is top-heavy and grows with the horizon; the
+    history coins' place mass is shifted down by a binomial count of
+    newcomers in the top 5, and the leftover mass is left unnamed so the
+    scorer shares it over the answer chart's un-named coins (newcomers
+    included);
   * sizes mix the Monte Carlo history distribution with a wide, higher
     newcomer component (a viral newcomer routinely exceeds the fading
-    history #1, as MAX did in the practice); the winner's-curse cap
-    applies to the history component only;
+    history #1, as MAX did in the practice -- its caps averaged log 4.6
+    against a history #1 near 3.5, so place 1's newcomer premium is
+    1.0); the winner's-curse cap applies to the history component only;
+  * place probabilities are sharpened (power 2.0, renormalised per
+    place): the Monte Carlo average over reads is flatter than the
+    realised per-read concentration, so the top coins earn more of each
+    place's named mass; the unnamed share is unchanged.
   * a coin is named at a place only when its probability beats the
     per-coin share the place would otherwise leave unnamed.
 """
@@ -41,6 +47,10 @@ import random
 from datetime import datetime
 
 SEED = 20261112
+TEMP_GAMMA = 2.0        # sharpen each place's probability distribution: the
+                     # Monte Carlo average over reads is flatter than the
+                     # realised per-read concentration (ablation: 1.0 -> 2.0
+                     # gains ~+0.4 local log; the curve plateaus at ~2.0)
 NSAMPLES = 4000
 MAX_CANDIDATES = 150
 TAU_H = 2.5            # drift decay time, hours
@@ -60,11 +70,11 @@ MICRO = 1_000_000
 # Place weights for the newcomer share: the largest coin at a read is
 # usually the freshest viral launch, so place 1 is newcomer-dominated
 # while places 2-3 are usually survivors (weights average 1.0).
-NEW_W = [1.7, 0.65, 0.65, 1.0, 1.0]
+NEW_W = [3.0, 0.65, 0.65, 1.0, 1.0]
 # Extra size premium of a newcomer taking place k, over the last mark's
 # k-th cap (place 1's premium is the largest: a viral newcomer routinely
 # exceeds the fading history #1, as MAX did in the practice).
-NEW_PREM = [0.6, 0.3, 0.25, 0.25, 0.25]
+NEW_PREM = [1.0, 0.3, 0.25, 0.25, 0.25]
 # Winner's-curse cap slack over the last mark's k-th cap, per place.
 WCAP = [1.0, 0.6, 0.5, 0.5, 0.5]
 
@@ -399,6 +409,24 @@ def main():
     for k in range(1, places + 1):
         for b in range(nbins):
             size_sum[k][b] /= n_reads
+
+    # ---- temperature calibration on place probabilities: sharpen each
+    # place's distribution (power > 1) and renormalise to the same total
+    # mass, keeping the unnamed share -- and therefore the size mix --
+    # unchanged. The average over reads spreads mass over too many coins;
+    # the realised top 5 at a read is concentrated on a few.
+    _tot = {}
+    for k in range(1, places + 1):
+        _tot[k] = sum(p_sum[m][k] for m in cand)
+    for mint in cand:
+        for k in range(1, places + 1):
+            p_sum[mint][k] = p_sum[mint][k] ** TEMP_GAMMA
+    for k in range(1, places + 1):
+        _new = sum(p_sum[m][k] for m in cand)
+        if _new > 0:
+            _f = _tot[k] / _new
+            for mint in cand:
+                p_sum[mint][k] *= _f
 
     # ---- emit probabilities: name a coin only while its p beats the share
     # the place would otherwise leave unnamed per un-named chart coin
